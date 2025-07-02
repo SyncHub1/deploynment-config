@@ -1,0 +1,174 @@
+version: '3.8'
+
+services:
+  # Redis for caching and message queues
+  redis:
+    image: redis:7-alpine
+    container_name: media-redis
+    ports:
+      - "127.0.0.1:6379:6379"  # Only accessible locally
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - media-internal
+
+  # MongoDB for metadata storage
+  mongodb:
+    image: mongo:6
+    container_name: media-mongodb
+    ports:
+      - "127.0.0.1:27017:27017"  # Only accessible locally
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: media-processing
+    volumes:
+      - mongodb_data:/data/db
+    restart: unless-stopped
+    networks:
+      - media-internal
+
+  # API Service
+  api-service:
+    build:
+      context: ./media-api-service
+      dockerfile: Dockerfile
+    container_name: media-api
+    ports:
+      - "127.0.0.1:3001:3001"  # Only accessible locally
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - REDIS_URL=redis://redis:6379
+      - MONGODB_URI=mongodb://admin:password@mongodb:27017/media-processing?authSource=admin
+      - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
+      - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
+      - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      - redis
+      - mongodb
+    restart: unless-stopped
+    volumes:
+      - ./media-api-service/uploads:/app/uploads
+    networks:
+      - media-internal
+      - media-external
+
+  # WebSocket Service
+  websocket-service:
+    build:
+      context: ./websocket-service
+      dockerfile: Dockerfile
+    container_name: media-websocket
+    ports:
+      - "127.0.0.1:3002:3002"  # Only accessible locally
+    environment:
+      - NODE_ENV=production
+      - PORT=3002
+      - REDIS_URL=redis://redis:6379
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - media-internal
+      - media-external
+
+  # Image Processing Worker
+  image-worker:
+    build:
+      context: ./media-workers
+      dockerfile: Dockerfile
+    container_name: media-image-worker
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - MONGODB_URI=mongodb://admin:password@mongodb:27017/media-processing?authSource=admin
+      - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
+      - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
+      - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
+    depends_on:
+      - redis
+      - mongodb
+    restart: unless-stopped
+    volumes:
+      - ./media-workers/temp:/app/temp
+    command: npm run worker:image
+    networks:
+      - media-internal
+
+  # Media Processing Worker
+  media-worker:
+    build:
+      context: ./media-workers
+      dockerfile: Dockerfile
+    container_name: media-video-worker
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - MONGODB_URI=mongodb://admin:password@mongodb:27017/media-processing?authSource=admin
+      - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
+      - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
+      - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
+    depends_on:
+      - redis
+      - mongodb
+    restart: unless-stopped
+    volumes:
+      - ./media-workers/temp:/app/temp
+    command: npm run worker:media
+    networks:
+      - media-internal
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: media-frontend
+    ports:
+      - "3000:3000"  # Accessible from anywhere (needed for development)
+    environment:
+      - REACT_APP_API_URL=http://localhost:3001
+      - REACT_APP_WEBSOCKET_URL=ws://localhost:3002
+      - PORT=3000
+    depends_on:
+      - api-service
+      - websocket-service
+    restart: unless-stopped
+    networks:
+      - media-external
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: media-nginx
+    ports:
+      - "80:80"      # HTTP
+      - "443:443"    # HTTPS
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api-service
+      - websocket-service
+      - frontend
+    restart: unless-stopped
+    networks:
+      - media-external
+
+volumes:
+  redis_data:
+    name: media-redis-data
+  mongodb_data:
+    name: media-mongodb-data
+
+networks:
+  media-internal:
+    name: media-internal
+    internal: true  # This network is not accessible from outside Docker
+  media-external:
+    name: media-external 
